@@ -15,11 +15,10 @@ from aider.utils import ChdirTemporaryDirectory
 class TestInputOutput(unittest.TestCase):
     def test_line_endings_validation(self):
         # Test valid line endings
-        for ending in ["platform", "lf", "crlf"]:
+        expected = {"preserve": None, "platform": None, "lf": "\n", "crlf": "\r\n"}
+        for ending, newline in expected.items():
             io = InputOutput(line_endings=ending)
-            self.assertEqual(
-                io.newline, None if ending == "platform" else "\n" if ending == "lf" else "\r\n"
-            )
+            self.assertEqual(io.newline, newline)
 
         # Test invalid line endings
         with self.assertRaises(ValueError) as cm:
@@ -27,8 +26,71 @@ class TestInputOutput(unittest.TestCase):
         self.assertIn("Invalid line_endings value: invalid", str(cm.exception))
         # Check each valid option is in the error message
         self.assertIn("platform", str(cm.exception))
+        self.assertIn("preserve", str(cm.exception))
         self.assertIn("crlf", str(cm.exception))
         self.assertIn("lf", str(cm.exception))
+
+    def _roundtrip(self, raw, edit=("b", "B"), **kwargs):
+        """Write raw bytes, read via io, apply a one-line edit, write back, return bytes."""
+        with ChdirTemporaryDirectory():
+            io = InputOutput(pretty=False, fancy_input=False, **kwargs)
+            Path("f.txt").write_bytes(raw)
+            text = io.read_text("f.txt")
+            self.assertIsNotNone(text)
+            self.assertNotIn("\r", text)
+            io.write_text("f.txt", text.replace(*edit))
+            return Path("f.txt").read_bytes()
+
+    def test_preserve_crlf_line_endings(self):
+        self.assertEqual(self._roundtrip(b"a\r\nb\r\nc\r\n"), b"a\r\nB\r\nc\r\n")
+
+    def test_preserve_lf_line_endings(self):
+        self.assertEqual(self._roundtrip(b"a\nb\nc\n"), b"a\nB\nc\n")
+
+    def test_preserve_uses_majority_line_ending(self):
+        self.assertEqual(self._roundtrip(b"a\r\nb\r\nc\n"), b"a\r\nB\r\nc\r\n")
+
+    def test_explicit_line_endings_override_existing(self):
+        self.assertEqual(self._roundtrip(b"a\r\nb\r\n", line_endings="lf"), b"a\nB\n")
+        self.assertEqual(self._roundtrip(b"a\nb\n", line_endings="crlf"), b"a\r\nB\r\n")
+
+    def test_new_file_uses_platform_line_endings(self):
+        with ChdirTemporaryDirectory():
+            io = InputOutput(pretty=False, fancy_input=False)
+            io.write_text("new.txt", "a\nb\n")
+            nl = os.linesep.encode()
+            self.assertEqual(Path("new.txt").read_bytes(), b"a" + nl + b"b" + nl)
+
+    def test_preserve_utf8_bom(self):
+        raw = b"\xef\xbb\xbfa\r\nb\r\n"
+        self.assertEqual(self._roundtrip(raw), b"\xef\xbb\xbfa\r\nB\r\n")
+
+    def test_read_and_preserve_utf16(self):
+        raw = "a\r\nb\r\n".encode("utf-16")
+        self.assertEqual(self._roundtrip(raw), "a\r\nB\r\n".encode("utf-16"))
+
+    def test_read_and_preserve_cp1252(self):
+        raw = "caf\xe9 \u201cq\u201d\r\nb\r\n".encode("cp1252")
+        expected = "caf\xe9 \u201cq\u201d\r\nB\r\n".encode("cp1252")
+        self.assertEqual(self._roundtrip(raw), expected)
+
+    def test_write_unencodable_char_raises(self):
+        with ChdirTemporaryDirectory():
+            io = InputOutput(pretty=False, fancy_input=False)
+            raw = "caf\xe9\r\n".encode("cp1252")
+            Path("f.txt").write_bytes(raw)
+            with self.assertRaises(ValueError):
+                io.write_text("f.txt", "caf\xe9 \U0001f600\n")
+            self.assertEqual(Path("f.txt").read_bytes(), raw)
+
+    def test_binary_file_still_unreadable(self):
+        with ChdirTemporaryDirectory():
+            io = InputOutput(pretty=False, fancy_input=False)
+            Path("f.bin").write_bytes(b"\x00\xff\xfe\x80binary")
+            self.assertIsNone(io.read_text("f.bin", silent=True))
+            # Looks like a UTF-16 BOM, but the rest isn't valid UTF-16
+            Path("f.bin").write_bytes(b"\xff\xfe\x00")
+            self.assertIsNone(io.read_text("f.bin", silent=True))
 
     def test_no_color_environment_variable(self):
         with patch.dict(os.environ, {"NO_COLOR": "1"}):
