@@ -497,9 +497,9 @@ Once I have these, I can show you precisely how to do the thing.
         coder.run(with_message="hi")
         self.assertEqual(len(coder.abs_fnames), 2)
 
-        # Write some non-UTF8 text into the file
+        # Write some undecodable (binary) content into the file
         with open(file1, "wb") as f:
-            f.write(b"\x80abc")
+            f.write(b"\x80abc\x00")
 
         # Call the run method again with a message
         coder.run(with_message="hi")

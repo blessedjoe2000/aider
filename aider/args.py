@@ -781,9 +781,12 @@ def get_parser(default_config_files, git_root):
     )
     group.add_argument(
         "--line-endings",
-        choices=["platform", "lf", "crlf"],
-        default="platform",
-        help="Line endings to use when writing files (default: platform)",
+        choices=["preserve", "platform", "lf", "crlf"],
+        default="preserve",
+        help=(
+            "Line endings to use when writing files. 'preserve' keeps each existing file's"
+            " line endings and uses the platform default for new files (default: preserve)"
+        ),
     )
     group.add_argument(
         "-c",

@@ -729,8 +729,8 @@ Default: utf-8
 Environment variable: `AIDER_ENCODING`  
 
 ### `--line-endings VALUE`
-Line endings to use when writing files (default: platform)  
-Default: platform  
+Line endings to use when writing files. 'preserve' keeps each existing file's line endings and uses the platform default for new files (default: preserve)  
+Default: preserve  
 Environment variable: `AIDER_LINE_ENDINGS`  
 
 ### `--config CONFIG_FILE`

@@ -337,9 +337,9 @@ class TestCommands(TestCase):
         with codecs.open("foo.bad", "w", encoding="iso-8859-15") as f:
             f.write("ÆØÅ")  # Characters not present in utf-8
 
+        # Legacy 8-bit encodings are detected, so the file can still be added
         commands.cmd_add("foo.bad")
-
-        self.assertEqual(coder.abs_fnames, set())
+        self.assertEqual(coder.abs_fnames, {str(Path("foo.bad").resolve())})
 
     def test_cmd_git(self):
         # Initialize the Commands and InputOutput objects
@@ -1048,8 +1048,15 @@ class TestCommands(TestCase):
         with open(fname, "wb") as f:
             f.write(some_content_which_will_error_if_read_with_encoding_utf8)
 
+        # UTF-16 files are detected by their BOM, so the file can still be added
         commands.cmd_add("file.txt")
-        self.assertEqual(coder.abs_fnames, set())
+        self.assertEqual(coder.abs_fnames, {str(Path(fname).resolve())})
+
+        # Genuinely undecodable (binary) content is still rejected
+        with open("binary.dat", "wb") as f:
+            f.write(b"\x80\x00\xff")
+        commands.cmd_add("binary.dat")
+        self.assertEqual(coder.abs_fnames, {str(Path(fname).resolve())})
 
     def test_cmd_add_read_only_file(self):
         with GitTemporaryDirectory():

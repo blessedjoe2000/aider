@@ -253,7 +253,7 @@ class InputOutput:
         completion_menu_current_bg_color=None,
         code_theme="default",
         encoding="utf-8",
-        line_endings="platform",
+        line_endings="preserve",
         dry_run=False,
         llm_history_file=None,
         editingmode=EditingMode.EMACS,
@@ -321,15 +321,15 @@ class InputOutput:
             self.chat_history_file = None
 
         self.encoding = encoding
-        valid_line_endings = {"platform", "lf", "crlf"}
+        self._encoding_warned = set()
+        valid_line_endings = {"preserve", "platform", "lf", "crlf"}
         if line_endings not in valid_line_endings:
             raise ValueError(
                 f"Invalid line_endings value: {line_endings}. "
                 f"Must be one of: {', '.join(valid_line_endings)}"
             )
-        self.newline = (
-            None if line_endings == "platform" else "\n" if line_endings == "lf" else "\r\n"
-        )
+        self.line_endings = line_endings
+        self.newline = {"lf": "\n", "crlf": "\r\n"}.get(line_endings)
         self.dry_run = dry_run
 
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -450,13 +450,71 @@ class InputOutput:
             self.tool_error(f"{filename}: {e}")
             return
 
+    # Longest BOMs first, since the UTF-32-LE BOM starts with the UTF-16-LE BOM.
+    _BOMS = (
+        (b"\xff\xfe\x00\x00", "utf-32-le"),
+        (b"\x00\x00\xfe\xff", "utf-32-be"),
+        (b"\xef\xbb\xbf", "utf-8"),
+        (b"\xff\xfe", "utf-16-le"),
+        (b"\xfe\xff", "utf-16-be"),
+    )
+
+    def _detect_encoding(self, data):
+        """
+        Work out how a file's bytes are encoded, so it can be read and later
+        written back in the same encoding.
+
+        Returns (encoding, bom), or (None, b"") if the bytes can't be decoded.
+        """
+        for bom, encoding in self._BOMS:
+            if data.startswith(bom):
+                try:
+                    data[len(bom) :].decode(encoding)
+                    return encoding, bom
+                except UnicodeDecodeError:
+                    return None, b""
+
+        candidates = [self.encoding]
+        # Only guess at legacy 8-bit encodings for things that look like text;
+        # NUL bytes mean binary, which should keep failing to read.
+        if b"\x00" not in data:
+            candidates += ["utf-8", "cp1252", "latin-1"]
+
+        for encoding in candidates:
+            try:
+                data.decode(encoding)
+                return encoding, b""
+            except (UnicodeDecodeError, LookupError):
+                continue
+        return None, b""
+
+    @staticmethod
+    def _detect_newline(text):
+        """Return the dominant line ending in text, or None if it has no line breaks."""
+        crlf = text.count("\r\n")
+        lf = text.count("\n") - crlf
+        cr = text.count("\r") - crlf
+        best = max((crlf, "\r\n"), (lf, "\n"), (cr, "\r"))
+        return best[1] if best[0] else None
+
+    def _existing_format(self, filename):
+        """Return (encoding, bom, newline) of an existing file, or None if it can't be read."""
+        try:
+            data = Path(filename).read_bytes()
+        except OSError:
+            return None
+        encoding, bom = self._detect_encoding(data)
+        if encoding is None:
+            return None
+        newline = self._detect_newline(data[len(bom) :].decode(encoding))
+        return encoding, bom, newline
+
     def read_text(self, filename, silent=False):
         if is_image_file(filename):
             return self.read_image(filename)
 
         try:
-            with open(str(filename), "r", encoding=self.encoding) as f:
-                return f.read()
+            data = Path(filename).read_bytes()
         except FileNotFoundError:
             if not silent:
                 self.tool_error(f"{filename}: file not found error")
@@ -469,15 +527,40 @@ class InputOutput:
             if not silent:
                 self.tool_error(f"{filename}: unable to read: {err}")
             return
-        except UnicodeError as e:
+
+        encoding, bom = self._detect_encoding(data)
+        if encoding is None:
             if not silent:
-                self.tool_error(f"{filename}: {e}")
+                try:
+                    data.decode(self.encoding)
+                except (UnicodeError, LookupError) as e:
+                    self.tool_error(f"{filename}: {e}")
                 self.tool_error("Use --encoding to set the unicode encoding.")
             return
+
+        if (
+            not bom
+            and encoding != self.encoding
+            and not silent
+            and str(filename) not in self._encoding_warned
+        ):
+            self._encoding_warned.add(str(filename))
+            self.tool_warning(
+                f"{filename}: not valid {self.encoding}, reading it as {encoding}."
+                " Edits will be saved in the same encoding."
+            )
+
+        text = data[len(bom) :].decode(encoding)
+        # Same universal-newline translation that text-mode open() does.
+        return text.replace("\r\n", "\n").replace("\r", "\n")
 
     def write_text(self, filename, content, max_retries=5, initial_delay=0.1):
         """
         Writes content to a file, retrying with progressive backoff if the file is locked.
+
+        If the file already exists, its encoding (including any BOM) is kept, and with
+        --line-endings=preserve (the default) so are its line endings. Only the lines
+        that actually changed will then show up in a diff.
 
         :param filename: Path to the file to write.
         :param content: Content to write to the file.
@@ -487,11 +570,31 @@ class InputOutput:
         if self.dry_run:
             return
 
+        encoding, bom, newline = self.encoding, b"", self.newline
+        existing = self._existing_format(filename)
+        if existing:
+            encoding, bom, existing_newline = existing
+            if self.line_endings == "preserve":
+                newline = existing_newline
+
+        if newline is None:
+            newline = os.linesep
+        try:
+            data = bom + content.replace("\n", newline).encode(encoding)
+        except UnicodeEncodeError as err:
+            msg = (
+                f"Unable to write file {filename}: the new content contains"
+                f" {err.object[err.start:err.end]!r}, which can't be represented in"
+                f" the file's {encoding} encoding."
+            )
+            self.tool_error(msg)
+            raise ValueError(msg) from err
+
         delay = initial_delay
         for attempt in range(max_retries):
             try:
-                with open(str(filename), "w", encoding=self.encoding, newline=self.newline) as f:
-                    f.write(content)
+                with open(str(filename), "wb") as f:
+                    f.write(data)
                 return  # Successfully wrote the file
             except PermissionError as err:
                 if attempt < max_retries - 1:
